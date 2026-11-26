@@ -4,15 +4,30 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
-import { db, dbPath } from "./db";
+import { db, dbPath, sqlite } from "./db";
 import { notifications } from "./db/schema";
-import { getConsumerStats, isConsumerConnected, startConsumer, stopConsumer } from "./events/consumer";
+import {
+  DLQ_QUEUE,
+  EXCHANGE,
+  QUEUE,
+  getChaosState,
+  getConsumerStats,
+  inspectQueues,
+  isConsumerConnected,
+  purgeDlq,
+  setConsumerPaused,
+  startConsumer,
+  stopConsumer,
+  triggerDlqTest,
+} from "./events/consumer";
 import { log } from "./logger";
 import { serializeNotification, sseHub } from "./realtime/sseHub";
 
 const PORT = Number(process.env.PORT ?? 3003);
 const SERVICE_NAME = "notifications-service";
 const HEARTBEAT_MS = 20_000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const MAX_NOTIFICATIONS = 100;
 const startedAt = Date.now();
 
 type AppEnv = { Variables: { correlationId: string } };
@@ -23,7 +38,7 @@ app.use(
   "*",
   cors({
     origin: "*",
-    allowMethods: ["GET", "PATCH", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PATCH", "OPTIONS"],
     allowHeaders: ["Content-Type", "X-Correlation-Id"],
     exposeHeaders: ["X-Correlation-Id"],
   }),
@@ -60,22 +75,50 @@ const studentQuerySchema = z.object({
   studentName: z.string().trim().min(1).optional(),
 });
 
+const chaosBodySchema = z.object({
+  paused: z.boolean(),
+  durationSeconds: z.number().int().min(5).max(30).optional(),
+});
+
 function countNotifications(where?: SQL): number {
   return db.select({ value: count() }).from(notifications).where(where).get()?.value ?? 0;
 }
 
-app.get("/health", (c) => {
+/** Keeps the demo DB small: only the latest MAX_NOTIFICATIONS rows survive. */
+function pruneOldNotifications(): void {
+  try {
+    const { changes } = sqlite
+      .prepare("DELETE FROM notifications WHERE id NOT IN (SELECT id FROM notifications ORDER BY id DESC LIMIT ?)")
+      .run(MAX_NOTIFICATIONS);
+    if (changes > 0) log("info", "db.notifications_pruned", { deletedCount: changes, kept: MAX_NOTIFICATIONS });
+  } catch (err) {
+    log("error", "db.prune_failed", { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function brokerSnapshot() {
+  const { pendingInQueue, dlqMessageCount } = await inspectQueues();
+  return {
+    ...getConsumerStats(),
+    pendingInQueue,
+    dlq: { queue: DLQ_QUEUE, messageCount: dlqMessageCount },
+  };
+}
+
+app.get("/health", async (c) => {
   const connected = isConsumerConnected();
+  const chaos = getChaosState();
   return c.json({
     service: SERVICE_NAME,
-    status: connected ? "healthy" : "degraded",
+    status: connected && !chaos.paused ? "healthy" : "degraded",
     database: {
       engine: "sqlite",
       file: basename(dbPath),
       status: "ok",
       notificationCount: countNotifications(),
     },
-    broker: getConsumerStats(),
+    broker: await brokerSnapshot(),
+    chaos,
     sseClients: sseHub.getClientCount(),
     uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
     timestamp: new Date().toISOString(),
@@ -192,7 +235,31 @@ app.get("/notifications/stream", (c) => {
   });
 });
 
-app.get("/events/stats", (c) => {
+app.get("/chaos", async (c) => {
+  return c.json({ chaos: getChaosState(), ...(await inspectQueues()), dlqQueue: DLQ_QUEUE });
+});
+
+app.post("/chaos", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = chaosBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "Invalid body", details: z.flattenError(parsed.error) }, 400);
+  }
+  await setConsumerPaused(parsed.data.paused, parsed.data.durationSeconds);
+  return c.json({ chaos: getChaosState(), ...(await inspectQueues()) });
+});
+
+app.post("/chaos/dlq-test", async (c) => {
+  const result = await triggerDlqTest();
+  return c.json(result, result.sent ? 200 : 503);
+});
+
+app.post("/chaos/dlq-purge", async (c) => {
+  const result = await purgeDlq();
+  return c.json(result, result.purged ? 200 : 503);
+});
+
+app.get("/events/stats", async (c) => {
   const rows = db
     .select()
     .from(notifications)
@@ -207,8 +274,8 @@ app.get("/events/stats", (c) => {
       eventId: n.eventId,
       eventType: n.eventType,
       routingKey: n.routingKey,
-      exchange: "cafeteria.events",
-      queue: "notifications.orders",
+      exchange: EXCHANGE,
+      queue: QUEUE,
       correlationId: n.correlationId,
       sourceService: n.sourceService,
       orderId: n.orderId,
@@ -223,7 +290,14 @@ app.get("/events/stats", (c) => {
     };
   });
 
-  return c.json({ broker: getConsumerStats(), sseClients: sseHub.getClientCount(), recentEvents });
+  const broker = await brokerSnapshot();
+  return c.json({
+    broker,
+    chaos: getChaosState(),
+    dlq: broker.dlq,
+    sseClients: sseHub.getClientCount(),
+    recentEvents,
+  });
 });
 
 app.notFound((c) => c.json({ error: "Not found" }, 404));
@@ -232,6 +306,9 @@ app.onError((err, c) => {
   log("error", "http.unhandled_error", { correlationId: c.get("correlationId"), error: err.message });
   return c.json({ error: "Internal server error" }, 500);
 });
+
+pruneOldNotifications();
+const pruneTimer = setInterval(pruneOldNotifications, PRUNE_INTERVAL_MS);
 
 startConsumer();
 
@@ -246,6 +323,7 @@ log("info", "server.started", { port: server.port, dbFile: basename(dbPath) });
 
 async function shutdown(signal: string) {
   log("info", "server.shutdown", { signal });
+  clearInterval(pruneTimer);
   await stopConsumer();
   server.stop(true);
   process.exit(0);
