@@ -34,6 +34,9 @@ if (!columns.some((col) => col.name === "image_url")) {
   sqlite.exec("ALTER TABLE menu_items ADD COLUMN image_url TEXT;");
 }
 
+// Idempotent migration: point existing volumes at the optimized .webp images
+sqlite.exec("UPDATE menu_items SET image_url = replace(image_url, '.jpeg', '.webp') WHERE image_url LIKE '/images/%.jpeg';");
+
 export const db = drizzle(sqlite, { schema: { menuItems } });
 
 const SEED: Omit<NewMenuItem, "createdAt">[] = [
@@ -44,7 +47,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 5000,
     prepMinutes: 8,
     emoji: "🌶️",
-    imageUrl: "/images/chilaquiles-verdes.jpeg",
+    imageUrl: "/images/chilaquiles-verdes.webp",
   },
   {
     name: "Enchiladas Suizas",
@@ -53,7 +56,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 7500,
     prepMinutes: 10,
     emoji: "🫔",
-    imageUrl: "/images/enchiladas-suizas.jpeg",
+    imageUrl: "/images/enchiladas-suizas.webp",
   },
   {
     name: "Molletes con chorizo",
@@ -62,7 +65,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 6500,
     prepMinutes: 7,
     emoji: "🥖",
-    imageUrl: "/images/molletes-chorizo.jpeg",
+    imageUrl: "/images/molletes-chorizo.webp",
   },
   {
     name: "Empanadas de queso",
@@ -71,7 +74,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 5000,
     prepMinutes: 6,
     emoji: "🥟",
-    imageUrl: "/images/empanadas.jpeg",
+    imageUrl: "/images/empanadas.webp",
   },
   {
     name: "Chocomilk",
@@ -80,7 +83,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 2500,
     prepMinutes: 2,
     emoji: "🍫",
-    imageUrl: "/images/chocomilk.jpeg",
+    imageUrl: "/images/chocomilk.webp",
   },
   {
     name: "Licuado de fresa",
@@ -89,7 +92,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 3000,
     prepMinutes: 3,
     emoji: "🍓",
-    imageUrl: "/images/licuado-fresa.jpeg",
+    imageUrl: "/images/licuado-fresa.webp",
   },
   {
     name: "Jugo de naranja",
@@ -98,7 +101,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 3500,
     prepMinutes: 2,
     emoji: "🍊",
-    imageUrl: "/images/jugo-naranja.jpeg",
+    imageUrl: "/images/jugo-naranja.webp",
   },
   {
     name: "Hot cakes",
@@ -107,7 +110,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 7500,
     prepMinutes: 8,
     emoji: "🥞",
-    imageUrl: "/images/hotcakes.jpeg",
+    imageUrl: "/images/hotcakes.webp",
   },
   {
     name: "Croissant",
@@ -116,7 +119,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 4000,
     prepMinutes: 2,
     emoji: "🥐",
-    imageUrl: "/images/croissant.jpeg",
+    imageUrl: "/images/croissant.webp",
   },
   {
     name: "Galleta",
@@ -125,7 +128,7 @@ const SEED: Omit<NewMenuItem, "createdAt">[] = [
     priceCents: 2000,
     prepMinutes: 1,
     emoji: "🍪",
-    imageUrl: "/images/galleta.jpeg",
+    imageUrl: "/images/galleta.webp",
   },
 ];
 
@@ -134,4 +137,31 @@ if ((existing?.n ?? 0) === 0) {
   const now = new Date().toISOString();
   db.insert(menuItems).values(SEED.map((item) => ({ ...item, createdAt: now }))).run();
   console.log(`[menu-service] seeded ${SEED.length} menu items`);
+}
+
+export const MAX_MENU_ITEMS = 30;
+const SEED_NAMES = SEED.map((item) => item.name);
+const CUSTOM_ITEM_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Keeps the public demo usable: never fully sold out, and custom dishes expire after 24h
+export function runDemoHygiene() {
+  const placeholders = SEED_NAMES.map(() => "?").join(", ");
+  const stats = sqlite
+    .query<{ total: number; available: number | null }, []>(
+      "SELECT count(*) AS total, sum(available) AS available FROM menu_items",
+    )
+    .get();
+  if (stats && stats.total > 0 && (stats.available ?? 0) === 0) {
+    const restored = sqlite
+      .query(`UPDATE menu_items SET available = 1 WHERE name IN (${placeholders})`)
+      .run(...SEED_NAMES);
+    console.log(`[menu-service] demo hygiene: restored ${restored.changes} seeded items to available`);
+  }
+  const cutoff = new Date(Date.now() - CUSTOM_ITEM_TTL_MS).toISOString();
+  const pruned = sqlite
+    .query(`DELETE FROM menu_items WHERE name NOT IN (${placeholders}) AND created_at < ?`)
+    .run(...SEED_NAMES, cutoff);
+  if (pruned.changes > 0) {
+    console.log(`[menu-service] demo hygiene: pruned ${pruned.changes} custom items older than 24h`);
+  }
 }
