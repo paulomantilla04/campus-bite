@@ -13,6 +13,8 @@ Navegador ──► gateway (Nginx :80)  ──►  /            React (dist/)
 - Excepción: `/api/notifications/stream` → `notifications-service:/notifications/stream` (SSE, sin buffering).
 - `GET /api/health` lo responde el propio gateway: `{"service":"api-gateway","status":"healthy"}`.
 - Si un servicio está caído, el gateway responde `503` JSON: `{"error":"service_unavailable",...}`. La UI y `/api/health` siguen funcionando.
+- **Rate limit** solo en escrituras (`POST`/`PATCH`/`DELETE` en `/api/menu/`, `/api/orders/`, `/api/notifications/`): `30r/m` por IP, `burst=15` (`nodelay`). Al excederlo → `429` JSON `{"error":"rate_limited","message":...,"correlationId"}`. `GET`/`OPTIONS`, el SSE y `/api/health` no se limitan.
+- `/images/*.webp` (fotos de platillos en `public/images/`) se sirven con `Cache-Control: public, max-age=604800, immutable` (7 días).
 - Toda respuesta lleva `X-Correlation-Id` (el que mandes tú o uno generado `corr-<request_id>`).
 - El frontend usa **siempre** rutas relativas `/api/...`: en `bun run dev` las resuelve el proxy de Vite (`vite.config.ts`) y en Docker/Dokploy el gateway Nginx.
 
@@ -34,6 +36,8 @@ Navegador ──► gateway (Nginx :80)  ──►  /            React (dist/)
 | PATCH | `/api/menu/items/:id` | `Partial<NewMenuItemInput>` (p. ej. `{ "available": false }`) | `{ item }` |
 | DELETE | `/api/menu/items/:id` | – | `{ deleted: true, id }` |
 | POST | `/api/menu/items/validate` | `{ items: [{ menuItemId, quantity }] }` | `{ valid: true, items: ValidatedLine[], totalCents }` · 400 `{ valid: false, errors }` (lo usa `orders-service`) |
+| GET | `/api/menu/chaos` | – | `{ chaos: { mode, delayMs, remainingSeconds } }` |
+| POST | `/api/menu/chaos` | `{ mode: "normal"\|"slow"\|"offline", delayMs?, durationSeconds? }` | `{ chaos }` · afecta a `/items/*`; vuelve solo a `normal` (máx. 30 s) |
 
 ### orders-service — `/api/orders`
 
@@ -57,6 +61,16 @@ Cada pedido creado publica `order.created` en RabbitMQ (exchange tópico, routin
 | PATCH | `/api/notifications/notifications/read-all` | `?studentName=` | `{ updatedCount }` |
 | GET | `/api/notifications/events/stats` | – | estadísticas del consumidor RabbitMQ / SSE |
 | GET (SSE) | `/api/notifications/stream` | `?studentName=Ana` (opcional, filtra) | evento `notification` con `Notification` en `data` |
+| GET | `/api/notifications/chaos` | – | `{ chaos, pendingInQueue, dlqMessageCount, dlqQueue }` |
+| POST | `/api/notifications/chaos` | `{ paused: boolean, durationSeconds? }` | pausa el consumidor; se reanuda solo (máx. 30 s) |
+| POST | `/api/notifications/chaos/dlq-test` | – | publica un mensaje inválido que acaba en la DLQ · 503 sin RabbitMQ |
+| POST | `/api/notifications/chaos/dlq-purge` | – | vacía la DLQ · 503 sin RabbitMQ |
+
+**Dead Letter Queue:** los mensajes rechazados de la cola principal `notifications.orders.v2` van al exchange `cafeteria.dlx` → cola `notifications.orders.dlq`.
+
+### Higiene automática de la demo
+
+Para que la demo pública no crezca sin control: máx. **50 pedidos** (se borran los más antiguos, y los `delivered`/`cancelled` de más de 24 h), **100 notificaciones** y **30 ítems de menú** (`POST /api/menu/items` devuelve 400 al llegar al límite).
 
 ### Tipos para `src/types.ts`
 
