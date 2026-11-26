@@ -1,9 +1,9 @@
 import { basename } from "node:path";
 import { and, count, eq, inArray, like, or, sql, type SQL } from "drizzle-orm";
-import { Hono } from "hono";
+import { Hono, type Context, type Next } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import { db, dbPath, sqlite } from "./db";
+import { db, dbPath, MAX_MENU_ITEMS, runDemoHygiene, sqlite } from "./db";
 import { CATEGORIES, menuItems } from "./db/schema";
 
 type Env = { Variables: { correlationId: string } };
@@ -31,6 +31,42 @@ app.use("*", async (c, next) => {
   console.log(`[menu-service] ${c.req.method} ${c.req.path} ${c.res.status} (${ms}ms) corr=${correlationId}`);
 });
 
+type ChaosMode = "normal" | "slow" | "offline";
+
+let chaos: { mode: ChaosMode; delayMs: number; expiresAt: number | null } = {
+  mode: "normal",
+  delayMs: 0,
+  expiresAt: null,
+};
+
+function getChaosState() {
+  if (chaos.expiresAt !== null && Date.now() >= chaos.expiresAt) {
+    chaos = { mode: "normal", delayMs: 0, expiresAt: null };
+  }
+  const remainingSeconds = chaos.expiresAt === null ? 0 : Math.ceil((chaos.expiresAt - Date.now()) / 1000);
+  return { mode: chaos.mode, delayMs: chaos.delayMs, remainingSeconds };
+}
+
+const chaosSchema = z.object({
+  mode: z.enum(["normal", "slow", "offline"]),
+  delayMs: z.number().int().min(250).max(5000).optional(),
+  durationSeconds: z.number().int().min(5).max(30).optional(),
+});
+
+const chaosMiddleware = async (c: Context<Env>, next: Next) => {
+  const state = getChaosState();
+  if (state.mode === "offline") {
+    return c.json(
+      { error: "menu-service simulated offline (chaos)", chaos: state, correlationId: c.get("correlationId") },
+      503,
+    );
+  }
+  if (state.mode === "slow") await Bun.sleep(state.delayMs);
+  await next();
+};
+// "/items/*" also matches "/items" itself in Hono
+app.use("/items/*", chaosMiddleware);
+
 const idParam = z.coerce.number().int().positive();
 
 const createSchema = z.object({
@@ -41,7 +77,16 @@ const createSchema = z.object({
   available: z.boolean().optional(),
   prepMinutes: z.number().int().positive().optional(),
   emoji: z.string().trim().min(1).optional(),
-  imageUrl: z.string().trim().min(1).nullable().optional(),
+  imageUrl: z
+    .string()
+    .trim()
+    .min(1)
+    .max(300)
+    .refine((url) => /^(\/images\/|https?:\/\/)/.test(url), {
+      message: "imageUrl must start with /images/, http:// or https://",
+    })
+    .nullable()
+    .optional(),
 });
 
 const updateSchema = createSchema.partial().refine((v) => Object.keys(v).length > 0, {
@@ -81,9 +126,11 @@ app.get("/health", (c) => {
   try {
     sqlite.query("SELECT 1").get();
     const [row] = db.select({ n: count() }).from(menuItems).all();
+    const chaosState = getChaosState();
     return c.json({
       service: "menu-service",
-      status: "healthy",
+      status: chaosState.mode === "normal" ? "healthy" : "degraded",
+      chaos: chaosState,
       database: { engine: "sqlite", file: basename(dbPath), status: "ok", itemCount: row?.n ?? 0 },
       uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
       timestamp: new Date().toISOString(),
@@ -100,6 +147,28 @@ app.get("/health", (c) => {
       503,
     );
   }
+});
+
+app.get("/chaos", (c) => c.json({ chaos: getChaosState() }));
+
+app.post("/chaos", async (c) => {
+  const parsed = chaosSchema.safeParse(await readJson(c));
+  if (!parsed.success) {
+    return c.json({ error: "Invalid request body", details: parsed.error.flatten() }, 400);
+  }
+  const body = parsed.data;
+  if (body.mode === "normal") {
+    chaos = { mode: "normal", delayMs: 0, expiresAt: null };
+  } else {
+    chaos = {
+      mode: body.mode,
+      delayMs: body.delayMs ?? (body.mode === "slow" ? 2500 : 0),
+      // durationSeconds is capped at 30s so no visitor can break the demo permanently
+      expiresAt: Date.now() + (body.durationSeconds ?? 20) * 1000,
+    };
+  }
+  console.log(`[menu-service] chaos set to ${chaos.mode} corr=${c.get("correlationId")}`);
+  return c.json({ chaos: getChaosState() });
 });
 
 app.get("/items", (c) => {
@@ -177,6 +246,10 @@ app.post("/items", async (c) => {
   if (!parsed.success) {
     return c.json({ error: "Invalid request body", details: parsed.error.flatten() }, 400);
   }
+  const [total] = db.select({ n: count() }).from(menuItems).all();
+  if ((total?.n ?? 0) >= MAX_MENU_ITEMS) {
+    return c.json({ error: `Demo limit reached (max ${MAX_MENU_ITEMS} menu items)` }, 400);
+  }
   const item = db
     .insert(menuItems)
     .values({ ...parsed.data, createdAt: new Date().toISOString() })
@@ -210,6 +283,10 @@ app.onError((err, c) => {
   console.error(`[menu-service] error corr=${c.get("correlationId")}`, err);
   return c.json({ error: "Internal server error" }, 500);
 });
+
+const DEMO_HYGIENE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+runDemoHygiene();
+setInterval(runDemoHygiene, DEMO_HYGIENE_INTERVAL_MS);
 
 const port = Number(process.env.PORT ?? 3001);
 console.log(`[menu-service] listening on http://localhost:${port} (db: ${dbPath})`);

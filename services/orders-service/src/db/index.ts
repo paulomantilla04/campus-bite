@@ -39,3 +39,18 @@ sqlite.exec(`
 
 export const db = drizzle(sqlite, { schema });
 export { schema };
+
+const MAX_ORDERS = 50;
+const FINISHED_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Keeps the public demo DB small; order_items cascade-delete via FK
+export function pruneOldOrders(): number {
+  const cutoff = new Date(Date.now() - FINISHED_ORDER_TTL_MS).toISOString();
+  const expired = sqlite
+    .query("DELETE FROM orders WHERE status IN ('delivered', 'cancelled') AND created_at < ?")
+    .run(cutoff);
+  const overflow = sqlite
+    .query("DELETE FROM orders WHERE id NOT IN (SELECT id FROM orders ORDER BY id DESC LIMIT ?)")
+    .run(MAX_ORDERS);
+  return expired.changes + overflow.changes;
+}

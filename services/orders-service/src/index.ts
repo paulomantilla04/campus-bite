@@ -4,7 +4,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { menuClient } from "./clients/menuClient";
-import { db, dbPath, sqlite } from "./db";
+import { db, dbPath, pruneOldOrders, sqlite } from "./db";
 import { ORDER_STATUSES, orderItems, orders, type OrderStatus, type OrderWithItems } from "./db/schema";
 import { getBrokerStatus, isBrokerConnected, publishEvent, startBroker, stopBroker, type OrderEventType } from "./events/broker";
 
@@ -255,6 +255,13 @@ app.onError((err, c) => {
   return c.json({ error: "internal server error", correlationId: c.get("correlationId") }, 500);
 });
 
+function runPrune() {
+  const pruned = pruneOldOrders();
+  if (pruned > 0) log("info", "pruned old orders", { pruned });
+}
+runPrune();
+const pruneTimer = setInterval(runPrune, 60 * 60 * 1000);
+
 startBroker();
 
 const server = Bun.serve({ port: PORT, fetch: app.fetch });
@@ -262,6 +269,7 @@ log("info", "orders-service listening", { port: server.port, dbPath });
 
 async function shutdown(signal: string) {
   log("info", "shutting down", { signal });
+  clearInterval(pruneTimer);
   server.stop();
   await stopBroker();
   sqlite.close();
