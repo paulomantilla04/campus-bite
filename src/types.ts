@@ -76,6 +76,24 @@ export interface NotificationItem {
   createdAt: string
 }
 
+export type MenuChaosMode = 'normal' | 'slow' | 'offline'
+
+export interface MenuChaosState {
+  mode: MenuChaosMode
+  delayMs: number
+  remainingSeconds: number
+}
+
+export interface NotificationsChaosState {
+  paused: boolean
+  remainingSeconds: number
+}
+
+export interface DlqInfo {
+  queue: string
+  messageCount: number
+}
+
 export interface BrokerStats {
   type: 'rabbitmq'
   status: 'connected' | 'disconnected'
@@ -85,6 +103,8 @@ export interface BrokerStats {
   consumedCount?: number
   duplicateCount?: number
   lastMessageAt?: string | null
+  pendingInQueue?: number
+  dlq?: DlqInfo
 }
 
 export interface ServiceHealthPayload {
@@ -100,6 +120,7 @@ export interface ServiceHealthPayload {
   }
   broker?: BrokerStats
   sseClients?: number
+  chaos?: MenuChaosState | NotificationsChaosState
   uptimeSeconds?: number
   timestamp?: string
 }
@@ -138,6 +159,8 @@ export interface EventsStatsResponse {
   broker: BrokerStats
   sseClients: number
   recentEvents: EventStreamItem[]
+  chaos?: NotificationsChaosState
+  dlq?: DlqInfo
 }
 
 export function formatMXN(cents: number): string {

@@ -1,5 +1,8 @@
 import type {
   Category,
+  MenuChaosMode,
+  MenuChaosState,
+  NotificationsChaosState,
   CreateOrderInput,
   EventsStatsResponse,
   MenuItem,
@@ -99,6 +102,18 @@ export async function deleteMenuItem(id: number): Promise<void> {
   })
 }
 
+export async function setMenuChaos(input: {
+  mode: MenuChaosMode
+  delayMs?: number
+  durationSeconds?: number
+}): Promise<MenuChaosState> {
+  const data = await request<{ chaos: MenuChaosState }>('/api/menu/chaos', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return data.chaos
+}
+
 // --- orders-service ---
 
 export async function fetchOrders(params?: {
@@ -176,6 +191,35 @@ export async function markAllNotificationsRead(studentName?: string): Promise<nu
 
 export async function fetchEventsStats(): Promise<EventsStatsResponse> {
   return request<EventsStatsResponse>('/api/notifications/events/stats')
+}
+
+export async function setNotificationsChaos(input: {
+  paused: boolean
+  durationSeconds?: number
+}): Promise<{ chaos: NotificationsChaosState; pendingInQueue?: number; dlqMessageCount?: number }> {
+  return request<{ chaos: NotificationsChaosState; pendingInQueue?: number; dlqMessageCount?: number }>(
+    '/api/notifications/chaos',
+    { method: 'POST', body: JSON.stringify(input) },
+  )
+}
+
+export interface DlqTestResult {
+  sent: boolean
+  dlqQueue?: string
+  dlqMessageCount?: number
+  pendingInQueue?: number
+  consumerPaused?: boolean
+  error?: string
+}
+
+export async function triggerDlqTest(): Promise<DlqTestResult> {
+  return request<DlqTestResult>('/api/notifications/chaos/dlq-test', { method: 'POST' })
+}
+
+export async function purgeDlq(): Promise<{ purged: boolean; deletedCount?: number }> {
+  return request<{ purged: boolean; deletedCount?: number }>('/api/notifications/chaos/dlq-purge', {
+    method: 'POST',
+  })
 }
 
 export function openNotificationStream(studentName?: string): EventSource {

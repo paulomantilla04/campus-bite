@@ -49,6 +49,13 @@ function describeOrderError(err: unknown): SubmitError {
         correlationId: err.correlationId,
       }
     }
+    if (err.status === 429) {
+      return {
+        title: 'Demasiadas peticiones (429)',
+        message: 'El gateway limitó tus pedidos por un momento. Espera unos segundos y vuelve a intentarlo; tu carrito sigue intacto.',
+        correlationId: err.correlationId,
+      }
+    }
     if (err.status >= 500) {
       return {
         title: `Servicio no disponible (${err.status})`,
@@ -481,7 +488,10 @@ export function StudentView({
   return (
     <div className="flex-1 max-w-[1440px] w-full mx-auto grid grid-cols-1 lg:grid-cols-[68fr_32fr]">
       {/* Left: editorial menu */}
-      <section className="px-6 sm:px-8 py-10 flex flex-col gap-8" aria-labelledby="student-menu-title">
+      <section
+        className={`px-6 sm:px-8 pt-10 flex flex-col gap-8 ${itemCount > 0 ? 'pb-24 lg:pb-10' : 'pb-10'}`}
+        aria-labelledby="student-menu-title"
+      >
         <motion.div
           initial={{ opacity: 0, y: 6 }}
           animate={{ opacity: 1, y: 0 }}
@@ -610,6 +620,7 @@ export function StudentView({
 
       {/* Right: sticky receipt rail */}
       <aside
+        id="student-receipt"
         className="bg-receipt border-t lg:border-t-0 lg:border-l border-hairline lg:sticky lg:top-14 lg:h-[calc(100dvh-56px)] flex flex-col justify-between overflow-y-auto"
         aria-label="Tu pedido y estado en vivo"
       >
@@ -766,6 +777,43 @@ export function StudentView({
 
         <LiveOrderStatus orders={orders} ordersLoading={ordersLoading} studentName={studentName} />
       </aside>
+
+      {/* Mobile floating cart bar */}
+      <AnimatePresence>
+        {itemCount > 0 && (
+          <div key="mobile-cart" className="lg:hidden fixed bottom-4 inset-x-4 z-30">
+            <motion.button
+              type="button"
+              initial={{ opacity: 0, y: 20, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 16, scale: 0.97 }}
+              whileTap={{ scale: 0.985 }}
+              transition={SPRING_SNAPPY}
+              onClick={() =>
+                document.getElementById('student-receipt')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }
+              aria-label={`Ver pedido: ${itemCount} ${itemCount === 1 ? 'artículo' : 'artículos'}, ${formatMXN(subtotalCents)}`}
+              className="w-full bg-espresso text-receipt rounded-card px-5 py-3.5 flex items-center justify-between shadow-[0_12px_32px_-8px_rgba(22,20,18,0.45)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-vermilion focus-visible:ring-offset-2"
+            >
+              <span className="flex flex-col items-start gap-0.5">
+                <span className="font-mono text-xs uppercase text-receipt/70 tabular-nums">
+                  {itemCount} {itemCount === 1 ? 'ARTÍCULO' : 'ARTÍCULOS'}
+                </span>
+                <motion.span
+                  key={subtotalCents}
+                  initial={{ opacity: 0.6, y: -2 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.18, ease: EASE_EDITORIAL }}
+                  className="font-display font-bold text-base tracking-tight tabular-nums"
+                >
+                  {formatMXN(subtotalCents)}
+                </motion.span>
+              </span>
+              <span className="font-display font-semibold text-xs tracking-tight text-receipt">Ver Pedido →</span>
+            </motion.button>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }

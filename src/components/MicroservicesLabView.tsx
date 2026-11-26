@@ -1,11 +1,22 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { fetchEventsStats, probeAllServices } from '../api'
+import {
+  ApiRequestError,
+  fetchEventsStats,
+  probeAllServices,
+  purgeDlq,
+  setMenuChaos,
+  setNotificationsChaos,
+  triggerDlqTest,
+} from '../api'
 import type {
   BrokerStats,
   EventStreamItem,
   EventsStatsResponse,
+  MenuChaosState,
   NotificationItem,
+  NotificationsChaosState,
+  ServiceHealthPayload,
   ServiceProbeResult,
 } from '../types'
 import { formatClockTime } from '../types'
@@ -22,6 +33,42 @@ type ServiceStatus = ServiceProbeResult['status']
 
 const REFRESH_INTERVAL_MS = 8000
 const EXCHANGE_NAME = 'cafeteria.events'
+const CHAOS_DURATION_SECONDS = 20
+const CHAOS_DELAY_MS = 2500
+
+type ChaosAction = 'menu-offline' | 'menu-slow' | 'notif-pause' | 'dlq-test' | 'dlq-purge'
+
+interface TimedChaos<T> {
+  state: T
+  until: number | null
+}
+
+function deadlineFrom(remainingSeconds: number, at: number): number | null {
+  return remainingSeconds > 0 ? at + remainingSeconds * 1000 : null
+}
+
+function secondsLeft(until: number | null, now: number): number {
+  return until ? Math.max(0, Math.ceil((until - now) / 1000)) : 0
+}
+
+function menuChaosOf(payload: ServiceHealthPayload | null | undefined): MenuChaosState | null {
+  const chaos = payload?.chaos
+  return chaos && 'mode' in chaos ? chaos : null
+}
+
+function notifChaosOf(payload: ServiceHealthPayload | null | undefined): NotificationsChaosState | null {
+  const chaos = payload?.chaos
+  return chaos && 'paused' in chaos ? chaos : null
+}
+
+function describeChaosError(err: unknown): string {
+  if (err instanceof ApiRequestError) {
+    if (err.status === 429) return 'Demasiadas peticiones (429) — espera unos segundos y reintenta.'
+    if (err.status >= 500) return `Servicio no disponible (${err.status}): ${err.message}`
+    return `Error ${err.status}: ${err.message}`
+  }
+  return err instanceof Error ? err.message : 'No se pudo aplicar la acción.'
+}
 
 const SERVICE_DEFAULTS: Record<ServiceKey, { name: string; subtitle: string }> = {
   menu: { name: 'menu-service', subtitle: 'Hono + Bun · menu.db' },
@@ -154,6 +201,67 @@ function ServiceTileSkeleton() {
   )
 }
 
+function ChaosButton({
+  active,
+  disabled,
+  onClick,
+  children,
+}: {
+  active: boolean
+  disabled: boolean
+  onClick: () => void
+  children: ReactNode
+}) {
+  return (
+    <motion.button
+      type="button"
+      whileTap={disabled ? undefined : { scale: 0.97 }}
+      transition={SPRING_SNAPPY}
+      onClick={onClick}
+      disabled={disabled}
+      aria-pressed={active}
+      className={`self-start px-3.5 py-1.5 rounded-card border font-display font-semibold text-xs tracking-tight tabular-nums transition-colors disabled:opacity-60 ${
+        active
+          ? 'bg-vermilion-cta border-vermilion-cta hover:bg-vermilion-hover text-receipt'
+          : 'bg-receipt border-hairline hover:border-espresso text-espresso'
+      }`}
+    >
+      {children}
+    </motion.button>
+  )
+}
+
+function ChaosTile({
+  service,
+  title,
+  description,
+  index,
+  children,
+}: {
+  service: string
+  title: string
+  description: string
+  index: number
+  children: ReactNode
+}) {
+  return (
+    <motion.div
+      custom={index}
+      variants={tileVariants}
+      initial="hidden"
+      animate="visible"
+      className="p-6 flex flex-col justify-between gap-5"
+    >
+      <div className="flex flex-col gap-1.5">
+        <span className="font-mono text-xs uppercase text-stone">{service}</span>
+        <h3 className="font-display font-semibold text-sm tracking-tight text-espresso">{title}</h3>
+        <p className="font-body text-sm text-stone">{description}</p>
+      </div>
+      <div className="flex flex-col gap-3">{children}</div>
+    </motion.div>
+  )
+}
+
 function EventInspectorSkeleton() {
   return (
     <>
@@ -188,24 +296,59 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
   const [refreshing, setRefreshing] = useState(false)
   const [filter, setFilter] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  const [menuChaos, setMenuChaosState] = useState<TimedChaos<MenuChaosState> | null>(null)
+  const [notifChaos, setNotifChaosState] = useState<TimedChaos<NotificationsChaosState> | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  const [busyAction, setBusyAction] = useState<ChaosAction | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const inFlight = useRef(false)
+  const queued = useRef(false)
   const mounted = useRef(true)
+  const firedDeadlines = useRef<Set<number>>(new Set())
+
+  const syncMenuChaos = useCallback((state: MenuChaosState) => {
+    const at = Date.now()
+    setNow(at)
+    setMenuChaosState({ state, until: deadlineFrom(state.remainingSeconds, at) })
+  }, [])
+
+  const syncNotifChaos = useCallback((state: NotificationsChaosState) => {
+    const at = Date.now()
+    setNow(at)
+    setNotifChaosState({ state, until: deadlineFrom(state.remainingSeconds, at) })
+  }, [])
 
   const refresh = useCallback(async () => {
-    if (inFlight.current) return
+    // A refresh requested mid-flight (e.g. right after a chaos action) runs once the current one ends.
+    if (inFlight.current) {
+      queued.current = true
+      return
+    }
     inFlight.current = true
     setRefreshing(true)
-    const started = Date.now()
     try {
-      const [probeResults, statsResult] = await Promise.all([
-        probeAllServices().catch(() => null),
-        fetchEventsStats().catch(() => null),
-      ])
-      const elapsed = Date.now() - started
-      if (elapsed < 380) await new Promise((r) => setTimeout(r, 380 - elapsed))
-      if (!mounted.current) return
-      if (probeResults) setProbes(probeResults)
-      setStats(statsResult)
+      do {
+        queued.current = false
+        const started = Date.now()
+        const [probeResults, statsResult] = await Promise.all([
+          probeAllServices().catch(() => null),
+          fetchEventsStats().catch(() => null),
+        ])
+        const elapsed = Date.now() - started
+        if (elapsed < 380) await new Promise((r) => setTimeout(r, 380 - elapsed))
+        if (!mounted.current) return
+        if (probeResults) setProbes(probeResults)
+        setStats(statsResult)
+
+        // Keep the last known chaos state when a service can't report it (e.g. simulated outage).
+        const menuState = menuChaosOf(probeResults?.find((p) => p.key === 'menu')?.payload)
+        if (menuState) syncMenuChaos(menuState)
+        const notifState =
+          notifChaosOf(probeResults?.find((p) => p.key === 'notifications')?.payload) ??
+          statsResult?.chaos ??
+          null
+        if (notifState) syncNotifChaos(notifState)
+      } while (queued.current && mounted.current)
     } finally {
       inFlight.current = false
       if (mounted.current) {
@@ -213,7 +356,7 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
         setInitialLoading(false)
       }
     }
-  }, [])
+  }, [syncMenuChaos, syncNotifChaos])
 
   useEffect(() => {
     mounted.current = true
@@ -230,6 +373,27 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
     const id = window.setInterval(() => void refresh(), REFRESH_INTERVAL_MS)
     return () => window.clearInterval(id)
   }, [refresh])
+
+  const menuUntil = menuChaos?.until ?? null
+  const notifUntil = notifChaos?.until ?? null
+
+  // 1s local countdown while any chaos timer runs; re-sync with the services as each one expires.
+  useEffect(() => {
+    const deadlines = [menuUntil, notifUntil].filter(
+      (d): d is number => d !== null && !firedDeadlines.current.has(d),
+    )
+    if (deadlines.length === 0) return
+    const id = window.setInterval(() => {
+      const t = Date.now()
+      setNow(t)
+      const expired = deadlines.filter((d) => d <= t && !firedDeadlines.current.has(d))
+      if (expired.length > 0) {
+        for (const d of expired) firedDeadlines.current.add(d)
+        void refresh()
+      }
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [menuUntil, notifUntil, refresh])
 
   const probeByKey = useMemo(() => {
     const map: Partial<Record<ServiceKey, ServiceProbeResult>> = {}
@@ -248,6 +412,71 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
   const notificationsOffline = probes !== null && statusOf('notifications') === 'offline'
 
   const sseClients = probeByKey.notifications?.payload?.sseClients ?? stats?.sseClients
+
+  const notifBroker = probeByKey.notifications?.payload?.broker ?? stats?.broker ?? null
+  const pendingInQueue = notifBroker?.pendingInQueue ?? stats?.broker?.pendingInQueue
+  const dlqCount = stats?.dlq?.messageCount ?? notifBroker?.dlq?.messageCount
+
+  const menuMode = menuChaos?.state.mode ?? 'normal'
+  const menuRemaining = secondsLeft(menuUntil, now)
+  const notifPaused = notifChaos?.state.paused ?? false
+  const notifRemaining = secondsLeft(notifUntil, now)
+
+  const runChaos = async (action: ChaosAction, task: () => Promise<void>) => {
+    if (busyAction) return
+    setBusyAction(action)
+    setActionError(null)
+    try {
+      await task()
+    } catch (err) {
+      if (mounted.current) setActionError(describeChaosError(err))
+    } finally {
+      if (mounted.current) setBusyAction(null)
+      void refresh()
+    }
+  }
+
+  const toggleMenuChaos = (mode: 'offline' | 'slow') =>
+    runChaos(mode === 'offline' ? 'menu-offline' : 'menu-slow', async () => {
+      const next =
+        menuMode === mode
+          ? await setMenuChaos({ mode: 'normal' })
+          : await setMenuChaos({
+              mode,
+              durationSeconds: CHAOS_DURATION_SECONDS,
+              ...(mode === 'slow' ? { delayMs: CHAOS_DELAY_MS } : {}),
+            })
+      if (mounted.current) syncMenuChaos(next)
+    })
+
+  const toggleNotifPause = () =>
+    runChaos('notif-pause', async () => {
+      const res = await setNotificationsChaos(
+        notifPaused ? { paused: false } : { paused: true, durationSeconds: CHAOS_DURATION_SECONDS },
+      )
+      if (mounted.current) syncNotifChaos(res.chaos)
+    })
+
+  const sendToDlq = () =>
+    runChaos('dlq-test', async () => {
+      const res = await triggerDlqTest()
+      if (!res.sent) throw new Error(res.error ?? 'Broker desconectado: no se pudo publicar el evento.')
+    })
+
+  const clearDlq = () =>
+    runChaos('dlq-purge', async () => {
+      const res = await purgeDlq()
+      if (!res.purged) throw new Error('No se pudo limpiar la DLQ.')
+    })
+
+  const chaosNote = (key: ServiceKey): string | null => {
+    if (key === 'menu' && menuMode !== 'normal') {
+      const label = menuMode === 'offline' ? 'OFFLINE' : `+${menuChaos?.state.delayMs ?? CHAOS_DELAY_MS}MS`
+      return `CHAOS: ${label} ${menuRemaining}S`
+    }
+    if (key === 'notifications' && notifPaused) return `PAUSADO ${notifRemaining}S`
+    return null
+  }
 
   const events = useMemo(() => stats?.recentEvents ?? [], [stats])
   const filteredEvents = useMemo(() => {
@@ -289,6 +518,16 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
     if (broker.queue) return `QUEUE: ${broker.queue}`
     return 'SIN TRÁFICO'
   })()
+
+  const queueDetail =
+    pendingInQueue !== undefined || dlqCount !== undefined
+      ? [
+          pendingInQueue !== undefined ? `COLA: ${pendingInQueue}` : null,
+          dlqCount !== undefined ? `DLQ: ${dlqCount}` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : null
 
   const serviceKeys: ServiceKey[] = ['menu', 'orders', 'notifications']
 
@@ -351,6 +590,7 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
                 const probe = probeByKey[key]
                 const status = statusOf(key)
                 const meta = serviceMeta(key)
+                const note = chaosNote(key)
                 return (
                   <motion.div
                     key={key}
@@ -373,6 +613,11 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
                       <p className="font-body text-sm text-stone">
                         {probe?.subtitle ?? SERVICE_DEFAULTS[key].subtitle}
                       </p>
+                      {note && (
+                        <span className="font-mono text-xs uppercase text-vermilion-cta tabular-nums">
+                          {note}
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center justify-between gap-3 font-mono text-xs uppercase tabular-nums">
                       {probe?.latencyMs != null ? (
@@ -414,7 +659,10 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
                     exchange: {broker?.exchange ?? EXCHANGE_NAME}
                   </p>
                 </div>
-                <span className="font-mono text-xs uppercase text-stone tabular-nums">{brokerDetail}</span>
+                <div className="flex flex-col gap-1 font-mono text-xs uppercase text-stone tabular-nums">
+                  <span>{brokerDetail}</span>
+                  {queueDetail && <span>{queueDetail}</span>}
+                </div>
               </motion.div>
             </>
           )}
@@ -502,7 +750,142 @@ export function MicroservicesLabView({ sseConnected, latestNotification }: Micro
         </div>
       </motion.section>
 
-      {/* 3. Event stream inspector */}
+      {/* 3. Chaos & DLQ simulator */}
+      <motion.section
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.28, delay: 0.11, ease: EASE_EDITORIAL }}
+        className="flex flex-col gap-4"
+        aria-labelledby="chaos-title"
+      >
+        <div className="flex items-baseline gap-3">
+          <h2 id="chaos-title" className="font-display font-bold text-lg tracking-tight text-espresso">
+            Simulador de Fallos
+          </h2>
+          <span className="font-mono text-xs uppercase text-stone">
+            AUTO-RECUPERACIÓN {CHAOS_DURATION_SECONDS}S
+          </span>
+        </div>
+
+        <div className="bg-receipt border border-hairline rounded-card grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-hairline">
+          <ChaosTile
+            index={0}
+            service="menu-service"
+            title="Caída"
+            description="Devuelve 503 al validar pedidos"
+          >
+            <ChaosButton
+              active={menuMode === 'offline'}
+              disabled={busyAction !== null}
+              onClick={() => void toggleMenuChaos('offline')}
+            >
+              {menuMode === 'offline'
+                ? `Restaurar (${menuRemaining}s)`
+                : `Simular caída (${CHAOS_DURATION_SECONDS}s)`}
+            </ChaosButton>
+          </ChaosTile>
+
+          <ChaosTile
+            index={1}
+            service="menu-service"
+            title="Latencia"
+            description="Agrega +2.5s de retraso al menú"
+          >
+            <ChaosButton
+              active={menuMode === 'slow'}
+              disabled={busyAction !== null}
+              onClick={() => void toggleMenuChaos('slow')}
+            >
+              {menuMode === 'slow'
+                ? `Restaurar (${menuRemaining}s)`
+                : `Inyectar +2.5s (${CHAOS_DURATION_SECONDS}s)`}
+            </ChaosButton>
+          </ChaosTile>
+
+          <ChaosTile
+            index={2}
+            service="notifications-service"
+            title="Pausar consumidor"
+            description="Encola mensajes en RabbitMQ sin consumir"
+          >
+            <span
+              className={`font-mono text-xs uppercase tabular-nums ${
+                notifPaused && (pendingInQueue ?? 0) > 0 ? 'text-vermilion-cta' : 'text-stone'
+              }`}
+            >
+              EN COLA: {pendingInQueue ?? '—'}
+            </span>
+            <ChaosButton
+              active={notifPaused}
+              disabled={busyAction !== null}
+              onClick={() => void toggleNotifPause()}
+            >
+              {notifPaused ? `Reanudar (${notifRemaining}s)` : `Pausar (${CHAOS_DURATION_SECONDS}s)`}
+            </ChaosButton>
+          </ChaosTile>
+
+          <ChaosTile
+            index={3}
+            service="rabbitmq"
+            title="Dead Letter Queue"
+            description="Publica evento malformado → DLQ"
+          >
+            <span
+              className={`font-mono text-xs uppercase tabular-nums ${
+                (dlqCount ?? 0) > 0 ? 'text-vermilion-cta' : 'text-stone'
+              }`}
+            >
+              DLQ: {dlqCount ?? '—'}
+            </span>
+            <div className="flex items-center gap-4">
+              <motion.button
+                type="button"
+                whileTap={busyAction ? undefined : { scale: 0.97 }}
+                transition={SPRING_SNAPPY}
+                onClick={() => void sendToDlq()}
+                disabled={busyAction !== null}
+                className="px-3.5 py-1.5 rounded-card bg-espresso hover:bg-stone text-receipt font-display font-semibold text-xs tracking-tight transition-colors disabled:opacity-60"
+              >
+                {busyAction === 'dlq-test' ? 'Enviando…' : 'Enviar a DLQ'}
+              </motion.button>
+              <AnimatePresence initial={false}>
+                {(dlqCount ?? 0) > 0 && (
+                  <motion.button
+                    key="purge"
+                    type="button"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.18 }}
+                    onClick={() => void clearDlq()}
+                    disabled={busyAction !== null}
+                    className="font-mono text-xs uppercase underline underline-offset-4 text-stone hover:text-vermilion-cta transition-colors disabled:opacity-60"
+                  >
+                    {busyAction === 'dlq-purge' ? 'Limpiando…' : 'Limpiar'}
+                  </motion.button>
+                )}
+              </AnimatePresence>
+            </div>
+          </ChaosTile>
+        </div>
+
+        <AnimatePresence>
+          {actionError && (
+            <motion.p
+              role="alert"
+              initial={{ opacity: 0, y: -3 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -3 }}
+              transition={{ duration: 0.2, ease: EASE_EDITORIAL }}
+              className="border-l-2 border-offline-red pl-3 font-mono text-xs text-offline-red"
+            >
+              {actionError}
+            </motion.p>
+          )}
+        </AnimatePresence>
+      </motion.section>
+
+      {/* 4. Event stream inspector */}
       <motion.section
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
