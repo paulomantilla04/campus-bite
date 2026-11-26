@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --color-paper: #F7F5F0;
+  --color-receipt: #FFFFFF;
+  --color-hairline: #E5E2DC;
+  --color-espresso: #161412;
+  --color-stone: #68615C;
+  --color-vermilion: #D94E28;
+  --color-vermilion-cta: #C4411E;
+  --color-vermilion-hover: #A83516;
+  --color-live-green: #15803D;
+  --color-offline-red: #B91C1C;
+
+  --font-display: "Montserrat", sans-serif;
+  --font-body: "Plus Jakarta Sans", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --radius-card: 8px;
+}
+
+@keyframes editorial-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@layer base {
+  html {
+    background-color: var(--color-paper);
+    color: var(--color-espresso);
+    font-family: var(--font-body);
+    scrollbar-gutter: stable;
+    overflow-x: clip;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-espresso);
+    font-family: var(--font-body);
+    overflow-x: clip;
+  }
+
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    #EFECE5 0%,
+    #F8F6F1 45%,
+    #EFECE5 90%
+  );
+  background-size: 220% 100%;
+  animation: editorial-shimmer 1.65s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-shimmer {
+    animation: none;
+    background: #EFECE5;
+  }
+}
